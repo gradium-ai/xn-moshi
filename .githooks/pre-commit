@@ -1,0 +1,7 @@
+#!/bin/sh
+
+cargo fmt -- --check
+if [ $? -ne 0 ]; then
+    echo "cargo fmt check failed. Run 'cargo fmt' to fix formatting."
+    exit 1
+fi
