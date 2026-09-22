@@ -57,6 +57,8 @@ pub struct Config {
     pub conditioners: std::collections::HashMap<String, ConditionerConfig>,
     #[serde(default)]
     pub stt_delay: SttDelayConfig,
+    #[serde(default)]
+    pub asr_delay_in_tokens: Option<usize>,
 }
 
 impl Config {

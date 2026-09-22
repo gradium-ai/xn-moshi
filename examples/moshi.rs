@@ -678,7 +678,7 @@ fn run_asr<Q: xn::BackendQ>(
 
     let target_sample_rate: usize = 24000;
     let frame_size: usize = 1920;
-    let asr_delay_in_seconds = 2.5;
+    let default_asr_delay_in_seconds = 2.5;
 
     // --- Load audio ---
     println!("Loading audio from {}...", input.display());
@@ -714,27 +714,29 @@ fn run_asr<Q: xn::BackendQ>(
     // --- Load LM ---
     println!("Loading LM weights...");
     let lm_vb = VB::load(&[files.lm], dev.clone())?;
-    let lm_config = match files.config {
-        Some(config) => config.to_lm_config(),
-        None => lm::Config::stt_2_6b(),
+    let (lm_config, asr_delay_in_tokens) = match &files.config {
+        Some(config) => (config.to_lm_config(), config.asr_delay_in_tokens),
+        None => (lm::Config::stt_2_6b(), None),
     };
     let lm: LmModel<Q> = LmModel::load(&lm_vb.root(), &lm_config)?;
     println!("  LM loaded");
 
     // --- Create ASR ---
-    let asr_delay_in_tokens =
-        (asr_delay_in_seconds * target_sample_rate as f64 / frame_size as f64) as usize;
+    let asr_delay_in_tokens = asr_delay_in_tokens.unwrap_or(
+        (default_asr_delay_in_seconds * target_sample_rate as f64 / frame_size as f64) as usize,
+    );
+    println!("  ASR delay: {asr_delay_in_tokens} tokens");
     let asr: Asr<Q> = Asr::new(asr_delay_in_tokens, temperature, mimi, lm);
     let mut state = asr.init_state(batch_size)?;
     let mask = StreamMask::all_active(batch_size);
 
     // --- Process audio ---
-    // Add two frames before the start of the audio, and two seconds of silence after
-    // the end.
+    // Add two frames before the start of the audio, and the ASR delay worth of silence
+    // after the end.
     let pcm_data = [
         vec![0.0; frame_size * 2],
         pcm_data,
-        vec![0.0; (target_sample_rate as f64 * asr_delay_in_seconds) as usize],
+        vec![0.0; asr_delay_in_tokens * frame_size],
     ]
     .concat();
     let num_chunks = pcm_data.len().div_ceil(frame_size);
