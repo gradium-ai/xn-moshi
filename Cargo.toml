@@ -1,6 +1,6 @@
 [package]
 name = "xn-moshi"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2024"
 description = "Moshi speech-to-speech, ASR and Mimi models running on the xn inference framework."
 repository = "https://github.com/gradium-ai/xn-moshi"
