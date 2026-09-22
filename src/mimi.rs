@@ -62,6 +62,9 @@ impl Config {
             positional_embedding: transformer::PositionalEmbedding::Rope,
             dim_feedforward: 2048,
             kv_repeat: 1,
+            head_dim: None,
+            final_norm: None,
+            proj_bias: false,
             conv_layout: true,
         };
         Config {
@@ -116,6 +119,9 @@ impl Config {
             positional_embedding: transformer::PositionalEmbedding::Rope,
             dim_feedforward: 2048,
             kv_repeat: 1,
+            head_dim: None,
+            final_norm: None,
+            proj_bias: false,
             conv_layout: true,
         };
         Config {

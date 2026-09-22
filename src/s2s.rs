@@ -3,6 +3,12 @@ use xn::nn::var_builder::Path;
 use xn::streaming::StreamMask;
 use xn::{Backend, BackendQ, Result, Tensor, WithDTypeF};
 
+/// Per-layer cross-attention keys and values.
+type CrossKv<Q> = Vec<(
+    Tensor<<Q as BackendQ>::T, <Q as BackendQ>::B>,
+    Tensor<<Q as BackendQ>::T, <Q as BackendQ>::B>,
+)>;
+
 pub fn add_sin_embeddings<T: WithDTypeF, B: Backend>(xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
     let (_b, seq_len, dim) = xs.dims3()?;
     let device = xs.device();
@@ -93,13 +99,36 @@ impl PerBatch {
     }
 }
 
+/// Classifier-free guidance state. When enabled, the internal batch of the
+/// main transformer and of the depformer is doubled: rows `[batch..2*batch)`
+/// form the unconditioned branch, which sees the same audio tokens but the
+/// conditioners dropped (their learnt padding) and a padding-only
+/// cross-attention source. There is no text stream to null out here, unlike
+/// the TTS model. The guidance `null + (cond - null) * coef` is applied to
+/// the audio logits of each depformer slice.
+struct CfgState<Q: BackendQ> {
+    /// Per batch item guidance coefficient, shape `(batch, 1)`.
+    coef: Tensor<Q::T, Q::B>,
+    /// Coefficient used for batch items that don't specify their own.
+    default_coef: f32,
+    /// Condition sum with every conditioner dropped, shape `(1, 1, dim)`.
+    null_condition_sum: Tensor<Q::T, Q::B>,
+    /// Per-layer cross-attention keys/values of the padding-only source,
+    /// computed once in [`Model::init_state`] and reused for the life of the
+    /// state (its shape only depends on the batch size and the constant
+    /// cross-attention source length, not on any per-session voice).
+    null_cross_kv: CrossKv<Q>,
+}
+
 pub struct State<Q: BackendQ> {
     pub model: std::sync::Arc<Model<Q>>,
     pub transformer: crate::transformer::BatchedTransformerState<Q::T, Q::B>,
     /// Per-layer cross-attention keys/values (one `CaSrc::KeysValues` per layer),
     /// computed once from the (constant) cross-attention source on the first
-    /// forward pass and reused afterwards.
+    /// forward pass and reused afterwards. With cfg, rows `[batch..2*batch)`
+    /// hold the padding-only source.
     cross_kv: Option<Vec<CaSrc<Q>>>,
+    cfg: Option<CfgState<Q>>,
     pub temperature: Tensor<f32, Q::B>,
     pub default_temperature: f32,
     per_batch: Vec<PerBatch>,
@@ -156,7 +185,7 @@ impl<Q: BackendQ> Model<Q> {
             num_heads: cfg.depformer.num_heads,
             dim_feedforward: cfg.depformer.dim_feedforward,
             num_layers: cfg.depformer.num_layers,
-            norm: crate::NormType::RmsNorm,
+            norm: crate::NormType::RmsNormF32,
             bias_attn: false,
             bias_ff: false,
             causal: true,
@@ -164,6 +193,9 @@ impl<Q: BackendQ> Model<Q> {
             conv_layout: false,
             gating: Some(crate::seanet::Activation::Silu),
             kv_repeat: 1,
+            head_dim: None,
+            final_norm: None,
+            proj_bias: false,
             layer_scale: None,
             max_period: 10_000.0,
             norm_first: true,
@@ -281,18 +313,47 @@ impl<Q: BackendQ> Model<Q> {
         self.conditioners.condition_sum(values)
     }
 
+    /// Initialize a generation state. When `cfg_coef` is set, classifier-free
+    /// guidance is enabled with this coefficient as the per-session default
+    /// (see [`State::set_cfg_coef`]); the internal batch is then doubled.
+    /// `ca_src_len` is the (constant, model-wide) length of the
+    /// cross-attention source and is only used to build the padding-only
+    /// source for the unconditioned branch when cfg is enabled.
     pub fn init_state(
         self: &std::sync::Arc<Self>,
         batch_size: usize,
         default_temperature: f32,
+        cfg_coef: Option<f32>,
+        ca_src_len: usize,
     ) -> Result<State<Q>> {
+        let full_batch_size = if cfg_coef.is_some() { 2 * batch_size } else { batch_size };
         let temperature: Tensor<f32, Q::B> =
             Tensor::full(default_temperature, (batch_size, 1), self.device())?;
         let n_slices = self.depformer.len();
+        let cfg = match cfg_coef {
+            None => None,
+            Some(default_coef) => {
+                let coef: Tensor<Q::T, Q::B> =
+                    Tensor::full(Q::T::from_f32(default_coef), (batch_size, 1), self.device())?;
+                let null_condition_sum = match self.condition_sum(&Default::default())? {
+                    Some(cs) => cs,
+                    None => xn::bail!("cfg requires conditioners with a learnt padding"),
+                };
+                let dim = self.text_emb.hidden_size();
+                let padding = self
+                    .speaker_wavs_learnt_padding
+                    .expand((batch_size, ca_src_len, dim))?
+                    .contiguous()?;
+                let padding = add_sin_embeddings(&padding)?;
+                let null_cross_kv = self.transformer.compute_cross_kv(&padding)?;
+                Some(CfgState { coef, default_coef, null_condition_sum, null_cross_kv })
+            }
+        };
         Ok(State {
             model: self.clone(),
-            transformer: self.transformer.init_state(batch_size)?,
+            transformer: self.transformer.init_state(full_batch_size)?,
             cross_kv: None,
+            cfg,
             temperature,
             default_temperature,
             per_batch: vec![PerBatch::new(n_slices); batch_size],
@@ -321,6 +382,27 @@ impl<Q: BackendQ> State<Q> {
         self.model.n_slices()
     }
 
+    /// Internal batch size of the main transformer and depformer: twice the
+    /// batch size when classifier-free guidance is enabled.
+    fn full_batch_size(&self) -> usize {
+        self.per_batch.len() * if self.cfg.is_some() { 2 } else { 1 }
+    }
+
+    /// Set the classifier-free guidance coefficient of the given batch item,
+    /// or restore the default coefficient when `coef` is `None`. Fails when
+    /// the state was built without cfg and a coefficient is provided.
+    pub fn set_cfg_coef(&mut self, batch_idx: usize, coef: Option<f32>) -> Result<()> {
+        if batch_idx >= self.batch_size() {
+            xn::bail!("batch_idx out of bounds");
+        }
+        if let Some(cfg) = self.cfg.as_mut() {
+            let coef = coef.unwrap_or(cfg.default_coef);
+            let coef = Tensor::full(Q::T::from_f32(coef), (1, 1), self.model.device())?;
+            cfg.coef.slice_set(&coef, 0, batch_idx)?;
+        }
+        Ok(())
+    }
+
     pub fn reset_batch_idx(&mut self, batch_idx: usize, temp: Option<f32>) -> Result<()> {
         if batch_idx >= self.batch_size() {
             xn::bail!("batch_idx out of bounds");
@@ -329,6 +411,13 @@ impl<Q: BackendQ> State<Q> {
         let temp = Tensor::full(temp, (1, 1), self.device())?;
         self.temperature.slice_set(&temp, 0, batch_idx)?;
         self.transformer.reset_batch_idx(batch_idx)?;
+        if let Some(cfg) = self.cfg.as_mut() {
+            // Also reset the paired unconditioned row, and restore the default
+            // guidance coefficient (see `Self::set_cfg_coef`).
+            self.transformer.reset_batch_idx(batch_idx + self.per_batch.len())?;
+            let coef = Tensor::full(Q::T::from_f32(cfg.default_coef), (1, 1), self.model.device())?;
+            cfg.coef.slice_set(&coef, 0, batch_idx)?;
+        }
         self.per_batch[batch_idx].reset();
         // The cross-attention source may change when a batch slot is reused for a
         // new voice, so drop the cached keys/values; they are recomputed lazily
@@ -352,19 +441,34 @@ impl<Q: BackendQ> State<Q> {
     fn forward(
         &mut self,
         audio_tokens: &[Vec<i64>],
-        ca_src: &CaSrc<Q>,
+        ca_src: &Tensor<Q::T, Q::B>,
         mask: &StreamMask,
         condition_sum: Option<&Tensor<Q::T, Q::B>>,
     ) -> Result<(Tensor<Q::T, Q::B>, Tensor<Q::T, Q::B>)> {
         use xn::ModuleT;
-        // Project the (constant) cross-attention source once, then reuse.
+        let batch_size = self.batch_size();
+        // Project the (constant) cross-attention source once, then reuse. With
+        // cfg, the unconditioned branch attends to a padding-only source of
+        // the same length, computed alongside and cached together.
         if self.cross_kv.is_none() {
-            self.cross_kv = Some(self.model.transformer.compute_cross_kv_ca_src(ca_src)?);
+            let real_kv = self.model.transformer.compute_cross_kv(ca_src)?;
+            self.cross_kv = Some(match self.cfg.as_ref() {
+                None => real_kv.into_iter().map(|(k, v)| CaSrc::KeysValues(k, v)).collect(),
+                Some(cfg) => real_kv
+                    .into_iter()
+                    .zip(cfg.null_cross_kv.iter())
+                    .map(|((rk, rv), (nk, nv))| {
+                        let k = Tensor::cat(&[&rk, nk], 0)?;
+                        let v = Tensor::cat(&[&rv, nv], 0)?;
+                        Ok(CaSrc::KeysValues(k, v))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+            });
         }
         let model = &self.model;
         let device = model.device();
         let d_model = model.text_emb.hidden_size();
-        let mut emb = Tensor::zeros((self.batch_size(), 1, d_model), device)?;
+        let mut emb = Tensor::zeros((batch_size, 1, d_model), device)?;
         // There are only audio embeddings and no text embeddings as gen_text is false for
         // this model.
         for (audio_emb, ids) in model.audio_embs.iter().zip(audio_tokens.iter()) {
@@ -372,12 +476,31 @@ impl<Q: BackendQ> State<Q> {
             let e = audio_emb.forward(&ids_t)?.unsqueeze(1)?;
             emb = emb.add(&e)?;
         }
-        let emb = match condition_sum {
-            None => emb,
-            Some(cond) => emb.broadcast_add(cond)?,
+        // With cfg, append the unconditioned branch: same audio embeddings,
+        // but the conditioners are dropped (null_condition_sum) instead of
+        // the real condition_sum.
+        let (emb, mask) = match self.cfg.as_ref() {
+            None => {
+                let emb = match condition_sum {
+                    None => emb,
+                    Some(cond) => emb.broadcast_add(cond)?,
+                };
+                (emb, std::borrow::Cow::Borrowed(mask))
+            }
+            Some(cfg) => {
+                let null_emb = emb.broadcast_add(&cfg.null_condition_sum)?;
+                let cond_emb = match condition_sum {
+                    None => emb,
+                    Some(cond) => emb.broadcast_add(cond)?,
+                };
+                let emb = Tensor::cat(&[&cond_emb, &null_emb], 0)?;
+                let full_mask: Vec<bool> =
+                    (0..2 * batch_size).map(|i| mask.is_active(i % batch_size)).collect();
+                (emb, std::borrow::Cow::Owned(StreamMask::new(full_mask)))
+            }
         };
         let cross_kv = self.cross_kv.as_ref().expect("cross_kv computed above");
-        let ys = model.transformer.forward(&emb, cross_kv, &mut self.transformer, mask)?;
+        let ys = model.transformer.forward(&emb, cross_kv, &mut self.transformer, &mask)?;
         let ys = model.out_norm.forward(&ys)?;
         let logits = model.text_linear.forward(&ys)?;
         Ok((logits, ys))
@@ -409,8 +532,14 @@ impl<Q: BackendQ> State<Q> {
         // The depformer slices share the same architecture, so a single state
         // can be reused: every slice extends the kv-cache by one position,
         // matching the moshi-rs `copy_state` propagation.
-        let mut state = model.depformer[0].transformer.init_state(batch_size)?;
-        let mask = StreamMask::all_active(batch_size);
+        let full_batch_size = self.full_batch_size();
+        // The depformer slices share the same architecture, so a single state
+        // can be reused: every slice extends the kv-cache by one position,
+        // matching the moshi-rs `copy_state` propagation. With cfg, `ys`
+        // already carries both branches (doubled batch); the token sampled
+        // from the guided logits is fed back to both.
+        let mut state = model.depformer[0].transformer.init_state(full_batch_size)?;
+        let mask = StreamMask::all_active(full_batch_size);
 
         let mut all_tokens: Vec<Vec<i64>> = Vec::with_capacity(model.depformer.len());
 
@@ -419,8 +548,18 @@ impl<Q: BackendQ> State<Q> {
             let xs = match all_tokens.last() {
                 None => xs,
                 Some(tokens) => {
-                    let token_id = Tensor::from_vec(tokens.clone(), batch_size, device)?;
-                    let token_emb = slice.emb.forward(&token_id)?.unsqueeze(1)?;
+                    let token_emb = match self.cfg.is_some() {
+                        false => {
+                            let token_id = Tensor::from_vec(tokens.clone(), batch_size, device)?;
+                            slice.emb.forward(&token_id)?.unsqueeze(1)?
+                        }
+                        true => {
+                            let doubled: Vec<i64> =
+                                tokens.iter().chain(tokens.iter()).copied().collect();
+                            let token_id = Tensor::from_vec(doubled, full_batch_size, device)?;
+                            slice.emb.forward(&token_id)?.unsqueeze(1)?
+                        }
+                    };
                     xs.add(&token_emb)?
                 }
             };
@@ -429,6 +568,15 @@ impl<Q: BackendQ> State<Q> {
             let logits = slice.linear_out.forward(&xs)?;
             let (b, _t, vocab) = logits.dims3()?;
             let logits_2d = logits.reshape((b, vocab))?;
+            let logits_2d = match self.cfg.as_ref() {
+                None => logits_2d,
+                Some(cfg) => {
+                    // Guidance: null + (cond - null) * coef.
+                    let cond = logits_2d.narrow(0, ..batch_size)?.contiguous()?;
+                    let null = logits_2d.narrow(0, batch_size..)?.contiguous()?;
+                    cond.sub(&null)?.broadcast_mul(&cfg.coef)?.add(&null)?
+                }
+            };
             let sampled = crate::sampling::gumbel_max(&logits_2d, temperature)?;
             let mut sampled_v: Vec<i64> = sampled.to_vec()?;
             if slice_idx == 0 {
@@ -463,7 +611,7 @@ impl<Q: BackendQ> State<Q> {
 
     pub fn step(
         &mut self,
-        ca_src: &CaSrc<Q>,
+        ca_src: &Tensor<Q::T, Q::B>,
         mask: &StreamMask,
         condition_sum: Option<&Tensor<Q::T, Q::B>>,
         semantic_tokens: &[i64],

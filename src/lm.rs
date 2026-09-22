@@ -21,6 +21,19 @@ pub struct Config {
 pub struct ExtraHeadsConfig {
     pub num_heads: usize,
     pub dim: usize,
+    /// Layer(s) of the main transformer providing the input of the extra
+    /// heads. With more than one layer, representations are mixed with a
+    /// [`LayerMixer`]. If `None`, the heads read the final (post-norm)
+    /// transformer output (legacy behavior).
+    pub from_layer: Option<Vec<usize>>,
+    /// Inner dimension of the extra heads' residual blocks (defaults to the
+    /// model dimension). Requires `residual_blocks > 0`.
+    pub hidden_dim: Option<usize>,
+    /// If false, the mixer's layer-norms have no learnt affine parameters.
+    pub mixer_affine: bool,
+    /// If > 0, each extra head is this many pre-norm residual MLP blocks
+    /// followed by a linear projection, instead of a single linear.
+    pub residual_blocks: usize,
 }
 
 impl Config {
@@ -39,10 +52,13 @@ impl Config {
             max_period: 100_000.0,
             use_conv_block: false,
             gating: Some(crate::seanet::Activation::Silu),
-            norm: crate::NormType::RmsNorm,
+            norm: crate::NormType::RmsNormF32,
             positional_embedding: transformer::PositionalEmbedding::Rope,
             conv_layout: false,
             kv_repeat: 1,
+            head_dim: None,
+            final_norm: None,
+            proj_bias: false,
         };
         Self {
             transformer,
@@ -69,10 +85,13 @@ impl Config {
             max_period: 100_000.0,
             use_conv_block: false,
             gating: Some(crate::seanet::Activation::Silu),
-            norm: crate::NormType::RmsNorm,
+            norm: crate::NormType::RmsNormF32,
             positional_embedding: transformer::PositionalEmbedding::Rope,
             conv_layout: false,
             kv_repeat: 1,
+            head_dim: None,
+            final_norm: None,
+            proj_bias: false,
         };
         Self {
             transformer,
@@ -99,10 +118,13 @@ impl Config {
             max_period: 100_000.0,
             use_conv_block: false,
             gating: Some(crate::seanet::Activation::Silu),
-            norm: crate::NormType::RmsNorm,
+            norm: crate::NormType::RmsNormF32,
             positional_embedding: transformer::PositionalEmbedding::Rope,
             conv_layout: false,
             kv_repeat: 1,
+            head_dim: None,
+            final_norm: None,
+            proj_bias: false,
         };
         Self {
             transformer,
@@ -111,6 +133,127 @@ impl Config {
             text_out_vocab_size: 48000,
             audio_codebooks: 32,
             extra_heads: None,
+        }
+    }
+}
+
+// ============================================================================
+// Extra heads
+// ============================================================================
+
+/// Mixes representations coming from several layers with input-dependent (per
+/// frame) weights: each input is layer-normalized, a scorer shared across
+/// layers computes a logit for each layer's normed features, added to a learnt
+/// per-layer bias, and the inputs are summed with the softmax of those logits.
+struct LayerMixer<T: xn::WithDTypeF, B: xn::Backend> {
+    norms: Vec<xn::nn::LayerNorm<T, B>>,
+    weights: Tensor<T, B>, // (num_inputs,)
+    scorer_in: Linear<T, B>,
+    scorer_out: Linear<T, B>,
+}
+
+impl<T: xn::WithDTypeF, B: xn::Backend> LayerMixer<T, B> {
+    fn load(vb: &Path<B>, num_inputs: usize, dim: usize, affine_norm: bool) -> Result<Self> {
+        let mut norms = Vec::with_capacity(num_inputs);
+        for i in 0..num_inputs {
+            let norm = if affine_norm {
+                xn::nn::LayerNorm::load(vb.pp("norms").pp(i), dim, 1e-5)?
+            } else {
+                let weight = Tensor::full(T::from_f32(1.0), (dim,), vb.device())?;
+                let bias = Tensor::zeros((dim,), vb.device())?;
+                xn::nn::LayerNorm::new(weight, bias, 1e-5)?
+            };
+            norms.push(norm);
+        }
+        let weights = vb.tensor("weights", (num_inputs,))?;
+        let hidden = usize::max(dim / 32, 32);
+        let scorer_in = Linear::load_b(vb.pp("scorer").pp(0), dim, hidden)?;
+        let scorer_out = Linear::load(vb.pp("scorer").pp(2), hidden, 1)?;
+        Ok(Self { norms, weights, scorer_in, scorer_out })
+    }
+
+    fn forward(&self, inputs: &[&Tensor<T, B>]) -> Result<Tensor<T, B>> {
+        if inputs.len() != self.norms.len() {
+            xn::bail!("layer-mixer input mismatch: {} != {}", inputs.len(), self.norms.len())
+        }
+        let mut normed = Vec::with_capacity(inputs.len());
+        let mut logits = Vec::with_capacity(inputs.len());
+        for (norm, xs) in self.norms.iter().zip(inputs.iter()) {
+            let xs = norm.forward(xs)?;
+            // (B, T, 1) logit for this layer.
+            let logit = self.scorer_out.forward(&self.scorer_in.forward(&xs)?.tanh()?)?;
+            normed.push(xs);
+            logits.push(logit);
+        }
+        let logits = Tensor::cat(&logits.iter().collect::<Vec<_>>(), 2)?; // (B, T, N)
+        let weights = logits.broadcast_add(&self.weights)?.softmax()?;
+        // Weighted sum as a single batched matmul:
+        // (B, T, 1, N) @ (B, T, N, C) -> (B, T, 1, C)
+        let stacked = Tensor::stack(&normed.iter().collect::<Vec<_>>(), 2)?;
+        let (b, t, n) = weights.dims3()?;
+        let ys = weights.reshape((b, t, 1, n))?.matmul(&stacked)?;
+        ys.reshape((b, t, stacked.dim(xn::D::Minus1)?))
+    }
+}
+
+/// Pre-norm residual MLP block: `x + linear_out(GELU(linear_in(norm(x))))`.
+struct ResidualMLPBlock<T: xn::WithDTypeF, B: xn::Backend> {
+    norm: xn::nn::LayerNorm<T, B>,
+    linear_in: Linear<T, B>,
+    linear_out: Linear<T, B>,
+}
+
+impl<T: xn::WithDTypeF, B: xn::Backend> ResidualMLPBlock<T, B> {
+    fn load(vb: &Path<B>, dim: usize, hidden: usize) -> Result<Self> {
+        let norm = xn::nn::LayerNorm::load(vb.pp("norm"), dim, 1e-5)?;
+        let linear_in = Linear::load(vb.pp("mlp").pp(0), dim, hidden)?;
+        let linear_out = Linear::load(vb.pp("mlp").pp(2), hidden, dim)?;
+        Ok(Self { norm, linear_in, linear_out })
+    }
+
+    fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+        let ys = self.norm.forward(xs)?;
+        let ys = self.linear_in.forward(&ys)?.gelu_erf()?;
+        let ys = self.linear_out.forward(&ys)?;
+        xs.add(&ys)
+    }
+}
+
+/// An extra linear probe (e.g. for VAD), either a single linear or a stack of
+/// pre-norm residual MLP blocks followed by a linear projection.
+enum ExtraHead<T: xn::WithDTypeF, B: xn::Backend> {
+    Linear(Linear<T, B>),
+    Mlp { blocks: Vec<ResidualMLPBlock<T, B>>, linear: Linear<T, B> },
+}
+
+impl<T: xn::WithDTypeF, B: xn::Backend> ExtraHead<T, B> {
+    fn load(vb: &Path<B>, d_model: usize, cfg: &ExtraHeadsConfig) -> Result<Self> {
+        if cfg.residual_blocks > 0 {
+            let hidden = cfg.hidden_dim.unwrap_or(d_model);
+            let mut blocks = Vec::with_capacity(cfg.residual_blocks);
+            for i in 0..cfg.residual_blocks {
+                blocks.push(ResidualMLPBlock::load(&vb.pp(i), d_model, hidden)?);
+            }
+            let linear = Linear::load(vb.pp(cfg.residual_blocks), d_model, cfg.dim)?;
+            Ok(Self::Mlp { blocks, linear })
+        } else {
+            if cfg.hidden_dim.is_some() {
+                xn::bail!("extra-heads hidden_dim requires residual_blocks > 0")
+            }
+            Ok(Self::Linear(Linear::load(vb, d_model, cfg.dim)?))
+        }
+    }
+
+    fn forward(&self, xs: &Tensor<T, B>) -> Result<Tensor<T, B>> {
+        match self {
+            Self::Linear(linear) => linear.forward(xs),
+            Self::Mlp { blocks, linear } => {
+                let mut xs = xs.clone();
+                for block in blocks.iter() {
+                    xs = block.forward(&xs)?;
+                }
+                linear.forward(&xs)
+            }
         }
     }
 }
@@ -134,7 +277,9 @@ pub struct LmModel<Q: BackendQ> {
     audio_embs: Vec<Embedding<Q::T, Q::B>>, // each (audio_vocab_size, d_model)
     text_linear: Q::LinearQ,
     out_norm: Norm<Q::T, Q::B>,
-    extra_heads: Vec<xn::nn::Linear<Q::T, Q::B>>, // each (dim, d_model)
+    extra_heads: Vec<ExtraHead<Q::T, Q::B>>,
+    extra_heads_mixer: Option<LayerMixer<Q::T, Q::B>>,
+    extra_heads_from_layer: Option<Vec<usize>>,
     audio_vocab_size: usize,
     text_in_vocab_size: usize,
     text_out_vocab_size: usize,
@@ -160,10 +305,31 @@ impl<Q: BackendQ> LmModel<Q> {
         }
 
         let mut extra_heads = vec![];
-        if let Some(ExtraHeadsConfig { num_heads, dim }) = &cfg.extra_heads {
-            for i in 0..*num_heads {
-                let head = Linear::load(vb.pp("extra_heads").pp(i), d_model, *dim)?;
-                extra_heads.push(head);
+        let mut extra_heads_mixer = None;
+        let mut extra_heads_from_layer = None;
+        if let Some(eh_cfg) = &cfg.extra_heads {
+            for i in 0..eh_cfg.num_heads {
+                extra_heads.push(ExtraHead::load(&vb.pp("extra_heads").pp(i), d_model, eh_cfg)?);
+            }
+            if let Some(layers) = &eh_cfg.from_layer {
+                if layers.is_empty() {
+                    xn::bail!("extra-heads from_layer cannot be empty")
+                }
+                if let Some(&l) = layers.iter().find(|&&l| l >= cfg.transformer.num_layers) {
+                    xn::bail!(
+                        "extra-heads from_layer {l} is out of range ({} layers)",
+                        cfg.transformer.num_layers
+                    )
+                }
+                if layers.len() > 1 {
+                    extra_heads_mixer = Some(LayerMixer::load(
+                        &vb.pp("extra_heads_mixer"),
+                        layers.len(),
+                        d_model,
+                        eh_cfg.mixer_affine,
+                    )?);
+                }
+                extra_heads_from_layer = Some(layers.clone());
             }
         }
 
@@ -174,6 +340,8 @@ impl<Q: BackendQ> LmModel<Q> {
             text_linear,
             out_norm,
             extra_heads,
+            extra_heads_mixer,
+            extra_heads_from_layer,
             audio_vocab_size: cfg.audio_vocab_size,
             text_in_vocab_size: cfg.text_in_vocab_size,
             text_out_vocab_size: cfg.text_out_vocab_size,
@@ -206,7 +374,11 @@ impl<Q: BackendQ> LmModel<Q> {
 }
 
 impl<Q: BackendQ> LmState<Q> {
-    /// Forward pass returning (text_logits, transformer_output).
+    /// Forward pass returning (text_logits, extra_head_input).
+    ///
+    /// The second value is the representation the extra heads should read:
+    /// intermediate layer(s), possibly mixed, when `from_layer` is set, and
+    /// the final (post-norm) transformer output otherwise.
     ///
     /// `text_ids`: token IDs per batch element (batch_size,), or None for zeros.
     /// `audio_ids`: per-codebook token IDs, each (batch_size,) or None to skip.
@@ -256,13 +428,34 @@ impl<Q: BackendQ> LmState<Q> {
         }
 
         // Transformer
-        let ys = model.transformer.forward(&emb, &mut self.transformer, mask)?;
+        let (ys, extra_head_input) = match &model.extra_heads_from_layer {
+            Some(layers) => {
+                let (ys, intermediates) = model.transformer.forward_with_intermediates(
+                    &emb,
+                    &mut self.transformer,
+                    mask,
+                )?;
+                let extra_head_input = match &model.extra_heads_mixer {
+                    Some(mixer) => {
+                        let inputs: Vec<&Tensor<Q::T, Q::B>> =
+                            layers.iter().map(|&l| &intermediates[l]).collect();
+                        mixer.forward(&inputs)?
+                    }
+                    None => intermediates[layers[0]].clone(),
+                };
+                (ys, Some(extra_head_input))
+            }
+            None => (model.transformer.forward(&emb, &mut self.transformer, mask)?, None),
+        };
         let ys = model.out_norm.forward(&ys)?;
         let logits = model.text_linear.forward(&ys)?;
-        Ok((logits, ys))
+        // Legacy behavior: the extra heads read the post-norm transformer output.
+        let extra_head_input = extra_head_input.unwrap_or(ys);
+        Ok((logits, extra_head_input))
     }
 
-    /// Compute extra head outputs from transformer output.
+    /// Compute extra head outputs from the extra-head input returned by
+    /// `forward`.
     pub fn extra_heads(&self, ys: &Tensor<Q::T, Q::B>) -> Result<Vec<Tensor<Q::T, Q::B>>> {
         let mut results = Vec::with_capacity(self.model.extra_heads.len());
         for head in &self.model.extra_heads {

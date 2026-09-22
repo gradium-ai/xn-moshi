@@ -55,6 +55,7 @@ mod item_state {
         last_stop_time: f64,
         token_booster: Option<Box<dyn TokenBooster>>,
         use_audio_pad_on_step_idx: Option<usize>,
+        asr_delay_in_tokens: Option<usize>,
     }
 
     impl ItemState {
@@ -68,10 +69,15 @@ mod item_state {
                 last_stop_time: 0.,
                 token_booster: None,
                 use_audio_pad_on_step_idx: None,
+                asr_delay_in_tokens: None,
             }
         }
 
-        pub fn reset(&mut self, token_booster: Option<Box<dyn TokenBooster>>) {
+        pub fn reset(
+            &mut self,
+            token_booster: Option<Box<dyn TokenBooster>>,
+            asr_delay_in_tokens: Option<usize>,
+        ) {
             self.step_idx = 0;
             self.text_token = 0;
             self.word_tokens.clear();
@@ -79,6 +85,7 @@ mod item_state {
             self.last_stop_time = 0.;
             self.token_booster = token_booster;
             self.use_audio_pad_on_step_idx = None;
+            self.asr_delay_in_tokens = asr_delay_in_tokens;
         }
 
         pub fn text_token(&self) -> u32 {
@@ -120,6 +127,7 @@ mod item_state {
             asr_delay_in_tokens: usize,
             words: &mut Vec<AsrWord>,
         ) {
+            let asr_delay_in_tokens = self.asr_delay_in_tokens.unwrap_or(asr_delay_in_tokens);
             self.text_token = text_token;
             self.step_idx += 1;
             if self.step_idx >= asr_delay_in_tokens {
@@ -156,6 +164,7 @@ mod item_state {
         }
 
         pub fn text_biases(&self, asr_delay_in_tokens: usize) -> Vec<(u32, f32)> {
+            let asr_delay_in_tokens = self.asr_delay_in_tokens.unwrap_or(asr_delay_in_tokens);
             if self.step_idx < asr_delay_in_tokens {
                 return vec![];
             }
@@ -178,6 +187,15 @@ pub struct AsrState<Q: BackendQ> {
     condition: Option<Tensor<Q::T, Q::B>>,
 }
 
+impl<Q: BackendQ> AsrState<Q> {
+    /// The full model config as parsed from the json file, `None` when the
+    /// model was loaded without one. Cheap to clone: the config is behind an
+    /// `Arc`.
+    pub fn config(&self) -> Option<std::sync::Arc<crate::moshi::Config>> {
+        self.model.config.clone()
+    }
+}
+
 #[derive(Clone)]
 pub struct Asr<Q: BackendQ> {
     asr_delay_in_tokens: usize,
@@ -186,6 +204,9 @@ pub struct Asr<Q: BackendQ> {
     audio_tokenizer: std::sync::Arc<Mimi<f32, Q::B>>,
     conditioners: Option<std::sync::Arc<Conditioners<Q::T, Q::B>>>,
     default_condition: Option<Tensor<Q::T, Q::B>>,
+    /// The full model config as parsed from the json file, when one was
+    /// provided to the loader.
+    config: Option<std::sync::Arc<crate::moshi::Config>>,
 }
 
 impl<Q: BackendQ> Asr<Q> {
@@ -202,11 +223,18 @@ impl<Q: BackendQ> Asr<Q> {
             audio_tokenizer: std::sync::Arc::new(audio_tokenizer),
             conditioners: None,
             default_condition: None,
+            config: None,
         }
     }
 
     pub fn conditioners(&self) -> Option<&Conditioners<Q::T, Q::B>> {
         self.conditioners.as_deref()
+    }
+
+    /// The full model config as parsed from the json file, `None` when the
+    /// model was loaded without one.
+    pub fn config(&self) -> Option<&crate::moshi::Config> {
+        self.config.as_deref()
     }
 
     pub fn init_state(&self, batch_size: usize) -> Result<AsrState<Q>> {
@@ -334,6 +362,7 @@ impl<Q: BackendQ> Asr<Q> {
             audio_tokenizer: std::sync::Arc::new(mimi_model),
             conditioners: conditioners.map(std::sync::Arc::new),
             default_condition,
+            config: moshi_config.map(std::sync::Arc::new),
         })
     }
 }
@@ -351,7 +380,7 @@ impl<Q: BackendQ> AsrState<Q> {
     }
 
     pub fn reset_state(&mut self) -> Result<()> {
-        self.batch.iter_mut().for_each(|s| s.reset(None));
+        self.batch.iter_mut().for_each(|s| s.reset(None, None));
         self.model_step_idx = 0;
         let batch_size = self.batch.len();
         self.lm = self.model.lm.init_state(batch_size)?;
@@ -494,19 +523,19 @@ impl<Q: BackendQ> AsrState<Q> {
             let audio_id_refs: Vec<Option<&[u32]>> =
                 audio_ids.iter().map(|ids| Some(ids.as_slice())).collect();
 
-            let (text_logits, transformer_out) = self.lm.forward(
+            let (text_logits, extra_head_input) = self.lm.forward(
                 Some(&text_tokens),
                 &audio_id_refs,
                 mask,
                 self.condition.as_ref(),
             )?;
             self.model_step_idx += 1;
-            // We compute self.text_bias as early as possible so that the CPU
+            // We compute self.text_bias as late as possible so that the CPU
             // computations take place while the cuda async computations are running.
             let text_bias = self.text_bias(self.model.asr_delay_in_tokens)?;
 
             // Extra heads
-            let extra_heads = self.lm.extra_heads(&transformer_out)?;
+            let extra_heads = self.lm.extra_heads(&extra_head_input)?;
             let mut prs = vec![];
             for extra_head in extra_heads.iter() {
                 // softmax on last dim, shape (batch, 1, dim) -> take (:, 0, 0)
@@ -553,11 +582,12 @@ impl<Q: BackendQ> AsrState<Q> {
         temp: Option<f64>,
         cond: Option<&Tensor<Q::T, Q::B>>,
         token_booster: Option<Box<dyn TokenBooster>>,
+        asr_delay_in_tokens: Option<usize>,
     ) -> Result<()> {
         if batch_idx >= self.batch.len() {
             xn::bail!("batch index out of range: {batch_idx} >= {}", self.batch.len());
         }
-        self.batch[batch_idx].reset(token_booster);
+        self.batch[batch_idx].reset(token_booster, asr_delay_in_tokens);
         self.lm.reset_batch_idx(batch_idx)?;
         self.audio_tokenizer.reset_batch_idx(batch_idx)?;
         let temp = temp.unwrap_or(self.model.default_temperature) as f32;

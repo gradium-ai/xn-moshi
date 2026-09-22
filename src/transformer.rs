@@ -20,6 +20,11 @@ fn default_false() -> bool {
 pub struct Config {
     pub d_model: usize,
     pub num_heads: usize,
+    /// Dimension per head, `d_model / num_heads` if not provided. When set,
+    /// the inner attention dimension `num_heads * head_dim` can differ from
+    /// `d_model` (e.g. the qwen decoder transformer).
+    #[serde(default)]
+    pub head_dim: Option<usize>,
     pub num_layers: usize,
     pub causal: bool,
     #[serde(default = "default_true")]
@@ -34,11 +39,25 @@ pub struct Config {
     pub use_conv_block: bool,
     pub gating: Option<crate::seanet::Activation>,
     pub norm: crate::NormType,
+    /// If provided, an extra normalization of this type is applied after the
+    /// last layer (e.g. the qwen decoder transformer).
+    #[serde(default)]
+    pub final_norm: Option<crate::NormType>,
     pub context: usize,
     pub max_period: f64,
     pub kv_repeat: usize,
     pub dim_feedforward: usize,
     pub conv_layout: bool,
+    /// Whether the input/output projections of the projected transformer have
+    /// a bias (e.g. the qwen decoder transformer).
+    #[serde(default = "default_false")]
+    pub proj_bias: bool,
+}
+
+impl Config {
+    pub fn head_dim(&self) -> usize {
+        self.head_dim.unwrap_or(self.d_model / self.num_heads)
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -127,6 +146,10 @@ impl<T: WithDTypeF, B: Backend> Norm<T, B> {
                 Ok(Self::LayerNorm { weight, bias, eps: 1e-5 })
             }
             crate::NormType::RmsNorm => {
+                let alpha = vb.tensor("alpha", (1, 1, d_model))?.reshape((d_model,))?;
+                Ok(Self::RmsNorm { alpha, eps: 1e-5 })
+            }
+            crate::NormType::RmsNormF32 => {
                 let alpha = vb.tensor("alpha", (1, 1, d_model))?.reshape((d_model,))?;
                 Ok(Self::RmsNorm { alpha, eps: 1e-8 })
             }
@@ -290,12 +313,19 @@ impl<Q: BackendQ> BatchedMultiheadAttention<Q> {
     pub(crate) fn load(vb: &Path<Q::B>, cfg: &Config) -> Result<Self> {
         let d_model = cfg.d_model;
         let num_heads = cfg.num_heads;
-        let head_dim = d_model / num_heads;
+        let head_dim = cfg.head_dim();
+        let inner_dim = num_heads * head_dim;
         let num_kv = num_heads / cfg.kv_repeat;
-        let out_dim = d_model + 2 * num_kv * head_dim;
+        let out_dim = inner_dim + 2 * num_kv * head_dim;
 
         let vb_attn = vb.pp("self_attn");
-        let in_proj_weight = vb_attn.tensor("in_proj_weight", (out_dim, d_model))?;
+        // Checkpoints use either the fused `in_proj_weight` name or the
+        // per-step ModuleList `in_projs.0.weight` / `out_projs.0.weight` names.
+        let in_proj_weight = if vb_attn.contains("in_proj_weight") {
+            vb_attn.tensor("in_proj_weight", (out_dim, d_model))?
+        } else {
+            vb_attn.pp("in_projs").pp(0).tensor("weight", (out_dim, d_model))?
+        };
         let in_proj = Linear::new(in_proj_weight);
         let in_proj = if cfg.bias_attn {
             let bias = vb_attn.tensor("in_proj_bias", (out_dim,))?;
@@ -305,7 +335,12 @@ impl<Q: BackendQ> BatchedMultiheadAttention<Q> {
         };
         let in_proj = Q::from_linear(in_proj)?;
 
-        let out_proj = Linear::load_o(vb_attn.pp("out_proj"), d_model, d_model, cfg.bias_attn)?;
+        let vb_out = if vb_attn.pp("out_proj").contains("weight") {
+            vb_attn.pp("out_proj")
+        } else {
+            vb_attn.pp("out_projs").pp(0)
+        };
+        let out_proj = Linear::load_o(vb_out, inner_dim, d_model, cfg.bias_attn)?;
         let out_proj = Q::from_linear(out_proj)?;
         Ok(Self { in_proj, out_proj, num_heads, head_dim, context: cfg.context })
     }
@@ -454,6 +489,7 @@ impl<Q: BackendQ> BatchedTransformerLayer<Q> {
 
 pub struct BatchedTransformer<Q: BackendQ> {
     layers: Vec<BatchedTransformerLayer<Q>>,
+    norm: Option<Norm<Q::T, Q::B>>,
     rope: Option<RotaryEmbedding<Q::B>>,
     positional_embedding: PositionalEmbedding,
     num_kv: usize,
@@ -480,22 +516,26 @@ impl<Q: BackendQ> BatchedTransformer<Q> {
             layers.push(BatchedTransformerLayer::load(&vb_layers.pp(i), cfg)?);
         }
 
+        let norm = match cfg.final_norm {
+            Some(norm_type) => Some(Norm::load(vb.pp("norm"), cfg.d_model, norm_type)?),
+            None => None,
+        };
+
         let rope = if cfg.positional_embedding == PositionalEmbedding::Rope {
-            let head_dim = cfg.d_model / cfg.num_heads;
-            Some(RotaryEmbedding::new(head_dim, cfg.max_period as f32, vb.device())?)
+            Some(RotaryEmbedding::new(cfg.head_dim(), cfg.max_period as f32, vb.device())?)
         } else {
             None
         };
 
         let num_kv = cfg.num_heads / cfg.kv_repeat;
-        let head_dim = cfg.d_model / cfg.num_heads;
 
         Ok(Self {
             layers,
+            norm,
             rope,
             positional_embedding: cfg.positional_embedding,
             num_kv,
-            head_dim,
+            head_dim: cfg.head_dim(),
             context: cfg.context,
             device: vb.device().clone(),
         })
@@ -516,6 +556,30 @@ impl<Q: BackendQ> BatchedTransformer<Q> {
         state: &mut BatchedTransformerState<Q::T, Q::B>,
         mask: &StreamMask,
     ) -> Result<Tensor<Q::T, Q::B>> {
+        let (xs, _) = self.forward_inner(xs, state, mask, false)?;
+        Ok(xs)
+    }
+
+    /// Same as `forward` but also returns the output of each layer (before the
+    /// final norm), e.g. for extra heads reading intermediate representations.
+    #[allow(clippy::type_complexity)]
+    pub fn forward_with_intermediates(
+        &self,
+        xs: &Tensor<Q::T, Q::B>,
+        state: &mut BatchedTransformerState<Q::T, Q::B>,
+        mask: &StreamMask,
+    ) -> Result<(Tensor<Q::T, Q::B>, Vec<Tensor<Q::T, Q::B>>)> {
+        self.forward_inner(xs, state, mask, true)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn forward_inner(
+        &self,
+        xs: &Tensor<Q::T, Q::B>,
+        state: &mut BatchedTransformerState<Q::T, Q::B>,
+        mask: &StreamMask,
+        output_intermediates: bool,
+    ) -> Result<(Tensor<Q::T, Q::B>, Vec<Tensor<Q::T, Q::B>>)> {
         let dims = xs.dims();
         let (b, t) = (dims[0], dims[1]);
         if b != state.batch_size() {
@@ -550,10 +614,17 @@ impl<Q: BackendQ> BatchedTransformer<Q> {
             PositionalEmbedding::Sin => xn::bail!("sin positional embedding is not supported"),
         };
 
+        let mut intermediates = vec![];
         for (layer, kv_cache) in self.layers.iter().zip(state.kv_caches.iter_mut()) {
             xs = layer.forward(&xs, rope.as_ref(), kv_cache, &iam)?;
+            if output_intermediates {
+                intermediates.push(xs.clone());
+            }
         }
-        Ok(xs)
+        if let Some(norm) = &self.norm {
+            xs = norm.forward(&xs)?;
+        }
+        Ok((xs, intermediates))
     }
 }
 
@@ -571,13 +642,21 @@ pub struct BatchedProjectedTransformer<Q: BackendQ> {
 impl<Q: BackendQ> BatchedProjectedTransformer<Q> {
     pub fn load(vb: &Path<Q::B>, input_dim: usize, cfg: &Config) -> Result<Self> {
         let input_proj = if input_dim != cfg.d_model {
-            let linear = Linear::load(vb.pp("input_proj"), input_dim, cfg.d_model)?;
+            let linear =
+                Linear::load_o(vb.pp("input_proj"), input_dim, cfg.d_model, cfg.proj_bias)?;
             Some(Q::from_linear(linear)?)
         } else {
             None
         };
         let output_proj = if input_dim != cfg.d_model {
-            let linear = Linear::load(vb.pp("output_proj").pp(0), cfg.d_model, input_dim)?;
+            // The checkpoint name for the ModuleList is `output_projs`; also
+            // accept the legacy `output_proj` spelling.
+            let vb_out = if vb.pp("output_proj").pp(0).contains("weight") {
+                vb.pp("output_proj").pp(0)
+            } else {
+                vb.pp("output_projs").pp(0)
+            };
+            let linear = Linear::load_o(vb_out, cfg.d_model, input_dim, cfg.proj_bias)?;
             Some(Q::from_linear(linear)?)
         } else {
             None

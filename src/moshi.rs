@@ -6,6 +6,32 @@ pub enum Gating {
     Silu,
 }
 
+/// One or several layer indices, deserializing from either a plain int or a
+/// list of ints (matching the python `int | list[int]` config values).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum LayerIndices {
+    Single(usize),
+    Multiple(Vec<usize>),
+}
+
+impl LayerIndices {
+    pub fn to_vec(&self) -> Vec<usize> {
+        match self {
+            Self::Single(l) => vec![*l],
+            Self::Multiple(ls) => ls.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct SttDelayConfig {
+    pub min_frames: Option<u64>,
+    pub max_frames: Option<u64>,
+    pub streaming_default_frames: Option<u64>,
+    pub offline_default_frames: Option<u64>,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub card: usize,
@@ -24,7 +50,13 @@ pub struct Config {
     pub gating: Gating,
     pub extra_heads_num_heads: Option<usize>,
     pub extra_heads_dim: Option<usize>,
+    pub extra_heads_from_layer: Option<LayerIndices>,
+    pub extra_heads_hidden_dim: Option<usize>,
+    pub extra_heads_mixer_affine: Option<bool>,
+    pub extra_heads_residual_blocks: Option<usize>,
     pub conditioners: std::collections::HashMap<String, ConditionerConfig>,
+    #[serde(default)]
+    pub stt_delay: SttDelayConfig,
 }
 
 impl Config {
@@ -43,6 +75,10 @@ impl Config {
             Some(crate::lm::ExtraHeadsConfig {
                 num_heads: extra_heads_num_heads,
                 dim: self.extra_heads_dim.unwrap_or(0),
+                from_layer: self.extra_heads_from_layer.as_ref().map(|ls| ls.to_vec()),
+                hidden_dim: self.extra_heads_hidden_dim,
+                mixer_affine: self.extra_heads_mixer_affine.unwrap_or(true),
+                residual_blocks: self.extra_heads_residual_blocks.unwrap_or(0),
             })
         } else {
             None
@@ -61,10 +97,13 @@ impl Config {
             max_period: self.max_period,
             use_conv_block: false,
             gating: Some(crate::seanet::Activation::Silu),
-            norm: crate::NormType::RmsNorm,
+            norm: crate::NormType::RmsNormF32,
             positional_embedding: crate::transformer::PositionalEmbedding::Rope,
             conv_layout: false,
             kv_repeat: 1,
+            head_dim: None,
+            final_norm: None,
+            proj_bias: false,
         };
         crate::lm::Config {
             transformer,

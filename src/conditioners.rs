@@ -247,14 +247,43 @@ impl<T: xn::WithDTypeF, B: xn::Backend> Conditioners<T, B> {
         for (name, lut) in self.lut.iter() {
             let emb = match values.get(name) {
                 Some(Value::Str(s)) => {
-                    let index = lut.config.possible_values.iter().position(|v| v == s).ok_or_else(|| {
-                        xn::Error::Msg(format!(
-                            "Invalid value for LUT conditioner {name}: {s}. Expected one of: {:?}",
-                            lut.config.possible_values
-                        ))
-                    })?;
-                    let index = Tensor::from_vec(vec![index as i64], (1,), lut.embed.device())?;
-                    lut.embed.index_select(&index, 0)?.reshape((1, 1, lut.output_dim))?
+                    // Mirror the python whitespace tokenizer with `sum: true`: each
+                    // whitespace-separated token is embedded and the embeddings are
+                    // summed, e.g. "en fr" conditions on both languages.
+                    // A value that is itself a possible value is embedded as-is:
+                    // `possible_values` may contain whitespace or be empty (the
+                    // padding entry) and the config we load carries neither
+                    // `tokenizer` nor `sum`.
+                    let words: Vec<&str> = if lut.config.possible_values.iter().any(|v| v == s) {
+                        vec![s.as_str()]
+                    } else {
+                        s.split_whitespace().collect()
+                    };
+                    let mut emb: Option<Tensor<T, B>> = None;
+                    for word in words {
+                        let index = lut
+                            .config
+                            .possible_values
+                            .iter()
+                            .position(|v| v == word)
+                            .ok_or_else(|| {
+                                xn::Error::Msg(format!(
+                                    "Invalid value for LUT conditioner {name}: {word}. Expected one of: {:?}",
+                                    lut.config.possible_values
+                                ))
+                            })?;
+                        let index = Tensor::from_vec(vec![index as i64], (1,), lut.embed.device())?;
+                        let row =
+                            lut.embed.index_select(&index, 0)?.reshape((1, 1, lut.output_dim))?;
+                        emb = Some(match emb {
+                            Some(acc) => acc.add(&row)?,
+                            None => row,
+                        });
+                    }
+                    match emb {
+                        Some(emb) => emb,
+                        None => xn::bail!("Empty value for LUT conditioner {name}"),
+                    }
                 }
                 Some(Value::Num(n)) => {
                     xn::bail!("Expected string value for LUT conditioner {name}, got number {n}")
